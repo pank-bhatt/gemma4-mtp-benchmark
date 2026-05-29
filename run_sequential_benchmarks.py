@@ -39,7 +39,7 @@ def run_benchmark(size):
         
         if process.returncode == 0:
             logger.info(f"✅ SUCCESS: Benchmark for Gemma 4 {size.upper()} completed successfully!")
-            logger.info(f"Report written to: /Users/pank/Experiments/MTP/results_detailed_{size}.md")
+            logger.info(f"Report written to: docs/results_detailed_{size}.md")
         else:
             logger.error(f"❌ ERROR: Benchmark for Gemma 4 {size.upper()} failed with exit code {process.returncode}")
             
