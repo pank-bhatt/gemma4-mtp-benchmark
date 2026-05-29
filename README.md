@@ -83,18 +83,21 @@ pip install -r requirements.txt
 ```
 
 ### 3. Running the Benchmarks
+> [!IMPORTANT]
+> **Virtual Environment Active:** You must run these scripts using your virtual environment Python to prevent import conflicts with old global libraries. Either ensure `venv` is active (`source venv/bin/activate`) or run using `venv/bin/python` directly.
+
 To run the multi-scenario benchmark for a specific model size (default is `e2b`):
 
 ```bash
 # Runs the baseline vs MTP benchmark simulation suite (JSON, Tool call, needles, logic)
-python run_benchmark.py --size e2b
+venv/bin/python run_benchmark.py --size e2b
 ```
 
 To run the full sequential benchmark pipeline across all supported Gemma 4 models (e2b ➡️ e4b ➡️ 26b ➡️ 31b) automatically:
 
 ```bash
 # Runs the multi-model automated sequential orchestrator
-python run_sequential_benchmarks.py
+venv/bin/python run_sequential_benchmarks.py
 ```
 
 To render the comparison visualization:
