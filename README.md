@@ -59,11 +59,18 @@ Across all scenarios, MTP achieved a net average speedup of **1.96x faster** on 
 ## 🛠️ Getting Started
 
 ### 1. Prerequisites
-Ensure you have PyTorch configured with Metal (MPS) support. The Gemma 4 models are gated on Hugging Face; you must accept Google's license agreement and authenticate locally.
+Ensure you have PyTorch configured with Metal (MPS) support. The Gemma 4 model series is **gated** on Hugging Face. Before running a benchmark, you must accept Google's license agreement for both target and assistant sizes:
+1. 🔓 Accept terms on [google/gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it)
+2. 🔓 Accept terms on [google/gemma-4-E2B-it-assistant](https://huggingface.co/google/gemma-4-E2B-it-assistant)
+
+Once approved, authenticate locally in your terminal:
 
 ```bash
-# Authenticate with your Hugging Face User Access Token
+# Option A: Authenticate using the Hugging Face CLI
 huggingface-cli login
+
+# Option B: Or set the environment variable directly
+export HF_TOKEN="your_huggingface_access_token_here"
 ```
 
 ### 2. Installation
