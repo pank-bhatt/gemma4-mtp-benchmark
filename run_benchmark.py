@@ -65,6 +65,13 @@ def parse_args():
         default=os.environ.get("HF_TOKEN", ""),
         help="Hugging Face User Access Token (optional if logged in via CLI)"
     )
+    parser.add_argument(
+        "--bits",
+        type=int,
+        default=16,
+        choices=[16, 4],
+        help="Quantization level in bits (16 or 4)"
+    )
     return parser.parse_args()
 
 def check_hf_access(model_id, token):
@@ -153,6 +160,7 @@ def run_single_inference(tokenizer, model, prompt_text, device, max_tokens, assi
 def main():
     args = parse_args()
     size = args.size.lower()
+    bits = args.bits
 
     # Map size to Hugging Face model IDs
     model_mappings = {
@@ -176,10 +184,14 @@ def main():
 
     target_id = model_mappings[size]["target"]
     assistant_id = model_mappings[size]["assistant"]
-    results_md_path = f"/Users/pank/Experiments/MTP/docs/results_detailed_{size}.md"
+    
+    if bits == 4:
+        results_md_path = f"/Users/pank/Experiments/MTP/docs/results_detailed_{size}_4bit.md"
+    else:
+        results_md_path = f"/Users/pank/Experiments/MTP/docs/results_detailed_{size}.md"
 
     logger.info("=========================================")
-    logger.info(f"Initializing Gemma 4 Simulation Suite for size: {size.upper()}")
+    logger.info(f"Initializing Gemma 4 Simulation Suite for size: {size.upper()} ({bits}-bit)")
     logger.info(f"Target:    {target_id}")
     logger.info(f"Assistant: {assistant_id}")
     logger.info("=========================================")
@@ -206,13 +218,28 @@ def main():
     logger.info(f"Loading Target Model '{target_id}' onto {device}...")
     target_start_time = time.time()
     
-    # Use CPU offloading and mem optimization flags to allow larger models to load safely
+    # Configure 4-bit loading via optimum-quanto if bits == 4
+    load_args = {
+        "torch_dtype": torch_dtype,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": True
+    }
+    
+    if bits == 4:
+        logger.info("Configuring 4-bit weight-only quantization via optimum-quanto (weights='int4')...")
+        from transformers import QuantoConfig
+        load_args["quantization_config"] = QuantoConfig(weights="int4")
+        load_args["device_map"] = device
+    
     target_model = AutoModelForCausalLM.from_pretrained(
         target_id,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True
-    ).to(device)
+        **load_args
+    )
+    
+    # manual movement to device is only needed if device_map is not used (which is required for 4-bit loads)
+    if bits != 4:
+        target_model = target_model.to(device)
+        
     target_model.eval()
     target_load_time = time.time() - target_start_time
     mem_post_target = get_current_rss_mb()
@@ -285,8 +312,9 @@ def main():
     # Compile Markdown file
     logger.info(f"Generating simulation report at: {results_md_path}")
     with open(results_md_path, "w") as f:
-        f.write(f"# Gemma 4 {size.upper()} MTP Detailed & Complicated Simulation Report\n\n")
-        f.write(f"This report presents the performance of standard autoregressive decoding (**Baseline**) versus Multi-Token Prediction speculative decoding (**MTP**) on **Gemma 4 {size.upper()}** across highly detailed, complex scenarios. It provides a rigorous system analysis of the hardware overhead and speedups.\n\n")
+        precision_str = "4-Bit Weight Quantized" if bits == 4 else "16-Bit Precision"
+        f.write(f"# Gemma 4 {size.upper()} MTP Detailed & Complicated Simulation Report ({precision_str})\n\n")
+        f.write(f"This report presents the performance of standard autoregressive decoding (**Baseline**) versus Multi-Token Prediction speculative decoding (**MTP**) on **Gemma 4 {size.upper()}** (loaded in **{precision_str}** via optimum-quanto) across highly detailed, complex scenarios. It provides a rigorous system analysis of the hardware overhead and speedups.\n\n")
         
         f.write("## 🖥️ System hardware Overhead & Static Pressure Analysis\n\n")
         f.write("When evaluating the resource footprint of Multi-Token Prediction, we must distinguish between **dynamic memory growth during inference** and **static loading memory overhead** on Unified Memory.\n\n")

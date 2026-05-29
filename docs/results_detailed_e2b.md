@@ -1,49 +1,49 @@
 # Gemma 4 E2B MTP Detailed & Complicated Simulation Report
 
-This report presents the performance of standard autoregressive decoding (**Baseline**) versus Multi-Token Prediction speculative decoding (**MTP**) on a set of highly detailed, complex, and high-entropy scenarios. It also provides a rigorous system analysis of the actual hardware overhead incurred by loading the auxiliary drafter model.
+This report presents the performance of standard autoregressive decoding (**Baseline**) versus Multi-Token Prediction speculative decoding (**MTP**) on **Gemma 4 E2B** across highly detailed, complex scenarios. It provides a rigorous system analysis of the hardware overhead and speedups.
 
 ## 🖥️ System hardware Overhead & Static Pressure Analysis
 
 When evaluating the resource footprint of Multi-Token Prediction, we must distinguish between **dynamic memory growth during inference** and **static loading memory overhead** on Unified Memory.
 
 ### 1. Static Load (Model Weight Memory Footprint)
-- **Baseline Static Footprint** (Gemma 4 E2B alone): **741.6 MB**
-- **MTP Static Footprint** (Gemma 4 E2B + Drafter loaded simultaneously): **844.6 MB**
-- **Absolute Hardware Overhead**: **+102.9 MB**
+- **Baseline Static Footprint** (Gemma 4 E2B alone): **734.0 MB**
+- **MTP Static Footprint** (Gemma 4 E2B + Drafter loaded simultaneously): **836.2 MB**
+- **Absolute Hardware Overhead**: **+102.3 MB**
 - **Relative Memory Increase**: **13.9% additional Unified RAM required**
 
 > [!IMPORTANT]
-> **System Overhead Insight**: While MTP generates tokens with minimal *dynamic* RAM growth during generation, it demands **an additional ~1.5 GB of static Unified Memory** to keep both models resident. On tight memory systems, this increases page swaps and memory compression overhead.
+> **System Overhead Insight**: While MTP generates tokens with minimal *dynamic* RAM growth during generation, it demands substantial static Unified Memory to keep both models resident. On consumer platforms, this increases page swaps and memory compression overhead.
 
 ### 2. CPU Dispatch & Context-Switching Pressure
 - **Standard Decoding**: Single loop execution. The CPU acts as a dispatcher only for one model.
 - **MTP speculative Decoding**: The CPU orchestrator runs a coordinated dual-model loop: scheduling token generation on the drafter, capturing and packing output tokens, verifying them via the target model's key-value (KV) projections, and synchronizing KV-caches. 
-- **CPU pressure Delta**: On predictable texts (like code or schema objects), MTP batches several token evaluations together, **reducing** overall CPU usage. However, on highly analytical or creative tasks where speculative tokens are frequently rejected, MTP introduces a **context-switching and draft rejection penalty**, increasing CPU scheduling overhead by up to **30%**.
+- **CPU pressure Delta**: On predictable texts (like code or schema objects), MTP batches several token evaluations together, **reducing** overall CPU usage. However, on highly analytical or creative tasks where speculative tokens are frequently rejected, MTP introduces a **context-switching and draft rejection penalty**, increasing CPU scheduling overhead.
 
 ## 📊 Summary Performance Table
 
 | Complicated Simulation Scenario | Mode | Speed (t/s) | Speedup Factor | Peak RAM (MB) | Avg CPU (%) | CPU Delta | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Strict JSON Schema Generation** | Baseline | 23.27 t/s | Ref (1.00x) | 2197.2 MB | 85.8% | - | - |
-| | **MTP (Spec)** | **56.88 t/s** | **2.44x** | **2447.4 MB** | **83.3%** | **-2.5%** | ✅ Active Speedup |
+| **Strict JSON Schema Generation** | Baseline | 24.06 t/s | Ref (1.00x) | 2191.4 MB | 87.0% | - | - |
+| | **MTP (Spec)** | **60.32 t/s** | **2.51x** | **2436.4 MB** | **83.6%** | **-3.4%** | ✅ Active Speedup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **Knights & Knaves Deduction** | Baseline | 24.57 t/s | Ref (1.00x) | 2717.0 MB | 88.0% | - | - |
-| | **MTP (Spec)** | **55.08 t/s** | **2.24x** | **3071.6 MB** | **84.5%** | **-3.6%** | ✅ Active Speedup |
+| **Knights & Knaves Deduction** | Baseline | 26.56 t/s | Ref (1.00x) | 2710.2 MB | 86.8% | - | - |
+| | **MTP (Spec)** | **55.98 t/s** | **2.11x** | **3057.5 MB** | **83.8%** | **-3.1%** | ✅ Active Speedup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **Multi-Turn Chat History Simulation** | Baseline | 28.25 t/s | Ref (1.00x) | 3139.2 MB | 89.2% | - | - |
-| | **MTP (Spec)** | **30.22 t/s** | **1.07x** | **3712.3 MB** | **85.9%** | **-3.3%** | ⚠️ Rejected Draft Overhead |
+| **Multi-Turn Chat History Simulation** | Baseline | 28.38 t/s | Ref (1.00x) | 3130.6 MB | 86.9% | - | - |
+| | **MTP (Spec)** | **30.18 t/s** | **1.06x** | **3704.2 MB** | **84.4%** | **-2.5%** | ⚠️ Rejected Draft Overhead |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **PLE Technical Needle Extraction** | Baseline | 25.49 t/s | Ref (1.00x) | 3829.5 MB | 86.4% | - | - |
-| | **MTP (Spec)** | **47.29 t/s** | **1.86x** | **4010.6 MB** | **83.7%** | **-2.7%** | ✅ Active Speedup |
+| **PLE Technical Needle Extraction** | Baseline | 25.50 t/s | Ref (1.00x) | 3822.3 MB | 84.7% | - | - |
+| | **MTP (Spec)** | **45.53 t/s** | **1.79x** | **4005.6 MB** | **82.2%** | **-2.4%** | ✅ Active Speedup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **Agentic Tool Calling Dispatch** | Baseline | 27.56 t/s | Ref (1.00x) | 4039.7 MB | 88.5% | - | - |
-| | **MTP (Spec)** | **63.18 t/s** | **2.29x** | **4097.5 MB** | **76.0%** | **-12.5%** | ✅ Active Speedup |
+| **Agentic Tool Calling Dispatch** | Baseline | 26.41 t/s | Ref (1.00x) | 4033.0 MB | 87.3% | - | - |
+| | **MTP (Spec)** | **69.43 t/s** | **2.63x** | **4086.9 MB** | **81.7%** | **-5.6%** | ✅ Active Speedup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 
 ### Overall Average Metrics:
-- **Average Baseline Speed**: **25.83 tokens/second**
-- **Average MTP Speed**: **50.53 tokens/second**
-- **Net Speedup Factor**: **1.96x faster**
+- **Average Baseline Speed**: **26.18 tokens/second**
+- **Average MTP Speed**: **52.29 tokens/second**
+- **Net Speedup Factor**: **2.00x faster**
 
 ## 📝 Detailed Prompt & Generations Log
 
@@ -111,7 +111,7 @@ Generate a valid JSON object matching the following schema. The JSON must contai
 }
 ```
 
-*Inference Speed: Baseline = 23.27 t/s | MTP = 56.88 t/s (2.44x speedup)*
+*Inference Speed: Baseline = 24.06 t/s | MTP = 60.32 t/s (2.51x speedup)*
 
 ---
 
@@ -163,7 +163,7 @@ E says ($S_E$): "Exactly four of us are knights." (i.e., $K=4$)
 We will test each
 ```
 
-*Inference Speed: Baseline = 24.57 t/s | MTP = 55.08 t/s (2.24x speedup)*
+*Inference Speed: Baseline = 26.56 t/s | MTP = 55.98 t/s (2.11x speedup)*
 
 ---
 
@@ -221,7 +221,7 @@ The memory footprint of the `asyncio` script will generally be **significantly l
 * **Low, Predictable Memory Usage:** `asyncio` operates
 ```
 
-*Inference Speed: Baseline = 28.25 t/s | MTP = 30.22 t/s (1.07x speedup)*
+*Inference Speed: Baseline = 28.38 t/s | MTP = 30.18 t/s (1.06x speedup)*
 
 ---
 
@@ -251,7 +251,7 @@ Here are the extracted points based on the technical description:
 *   **Speculative Token Length:** The speculative token length draft step is set to 3 because this length maximizes the acceptance probability while keeping the context memory overhead within bound constraints.
 ```
 
-*Inference Speed: Baseline = 25.49 t/s | MTP = 47.29 t/s (1.86x speedup)*
+*Inference Speed: Baseline = 25.50 t/s | MTP = 45.53 t/s (1.79x speedup)*
 
 ---
 
@@ -314,7 +314,7 @@ User request: I am planning a trip to Tokyo. Can you get the current weather for
 ]
 ```
 
-*Inference Speed: Baseline = 27.56 t/s | MTP = 63.18 t/s (2.29x speedup)*
+*Inference Speed: Baseline = 26.41 t/s | MTP = 69.43 t/s (2.63x speedup)*
 
 ---
 

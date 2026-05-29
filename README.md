@@ -86,18 +86,25 @@ pip install -r requirements.txt
 > [!IMPORTANT]
 > **Virtual Environment Active:** You must run these scripts using your virtual environment Python to prevent import conflicts with old global libraries. Either ensure `venv` is active (`source venv/bin/activate`) or run using `venv/bin/python` directly.
 
-To run the multi-scenario benchmark for a specific model size (default is `e2b`):
+By default, the runner uses standard **16-bit precision** (`--bits 16`). To run in memory-efficient **4-bit weight-quantized mode** using Hugging Face's `optimum-quanto` library, specify `--bits 4`.
+
+#### A. Running Standalone Models
+To run a specific size at a specific quantization level (e.g., E2B in 4-bit):
 
 ```bash
-# Runs the baseline vs MTP benchmark simulation suite (JSON, Tool call, needles, logic)
-venv/bin/python run_benchmark.py --size e2b
+# Runs E2B in 4-bit quantized mode (drastically reducing Unified RAM requirements)
+venv/bin/python run_benchmark.py --size e2b --bits 4
+
+# Runs E2B in standard 16-bit mode
+venv/bin/python run_benchmark.py --size e2b --bits 16
 ```
 
-To run the full sequential benchmark pipeline across all supported Gemma 4 models (e2b ➡️ e4b ➡️ 26b ➡️ 31b) automatically:
+#### B. Running the Automated Pipeline
+To run the full sequential benchmark pipeline across all supported Gemma 4 models (`e2b` ➡️ `e4b` ➡️ `26b` ➡️ `31b`) automatically in 4-bit:
 
 ```bash
-# Runs the multi-model automated sequential orchestrator
-venv/bin/python run_sequential_benchmarks.py
+# Runs the multi-model sequential orchestrator in 4-bit quantized mode
+venv/bin/python run_sequential_benchmarks.py --bits 4
 ```
 
 To render the comparison visualization:
