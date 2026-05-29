@@ -19,7 +19,7 @@ def run_benchmark(size):
     logger.info(f"STARTING SEQUENTIAL BENCHMARK PIPELINE FOR: Gemma 4 {size.upper()}")
     logger.info(f"===========================================================")
     
-    cmd = ["venv/bin/python", "run_detailed_benchmark.py", "--size", size]
+    cmd = ["venv/bin/python", "run_benchmark.py", "--size", size]
     
     try:
         # Run process and stream logs in real time
@@ -54,7 +54,7 @@ def main():
     logger.info("Target Sizes: E4B -> 26B -> 31B")
     logger.info("Download progress will be automatically tracked in logs/models.log")
     
-    sizes = ["e4b", "26b", "31b"]
+    sizes = ["e2b", "e4b", "26b", "31b"]
     
     for size in sizes:
         success = run_benchmark(size)

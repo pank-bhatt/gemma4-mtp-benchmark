@@ -76,18 +76,18 @@ pip install -r requirements.txt
 ```
 
 ### 3. Running the Benchmarks
-To run the primary benchmarking driver:
+To run the multi-scenario benchmark for a specific model size (default is `e2b`):
 
 ```bash
-# Runs the baseline vs MTP prompts benchmark
-python run_benchmark.py
+# Runs the baseline vs MTP benchmark simulation suite (JSON, Tool call, needles, logic)
+python run_benchmark.py --size e2b
 ```
 
-To run the detailed multi-scenario simulation profiling script (JSON schema, tool dispatching, PLE needles):
+To run the full sequential benchmark pipeline across all supported Gemma 4 models (e2b ➡️ e4b ➡️ 26b ➡️ 31b) automatically:
 
 ```bash
-# Runs the detailed multi-scenario suite
-python run_detailed_benchmark.py
+# Runs the multi-model automated sequential orchestrator
+python run_sequential_benchmarks.py
 ```
 
 To render the comparison visualization:

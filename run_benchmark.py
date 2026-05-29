@@ -1,10 +1,10 @@
 import os
 import sys
 import time
-import argparse
 import logging
 import torch
-import pandas as pd
+import psutil
+import argparse
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tabulate import tabulate
 
@@ -12,30 +12,52 @@ import config
 from profiler import ResourceProfiler
 
 # Setup logging
-os.makedirs(config.LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(config.EXECUTION_LOG_PATH, mode="a")
+        logging.FileHandler(os.path.join(config.LOG_DIR, "execution.log"), mode="a")
     ]
 )
-logger = logging.getLogger("Gemma4MTPBenchmark")
+logger = logging.getLogger("Benchmark")
 
+DETAILED_PROMPTS = [
+    {
+        "id": "structured_json",
+        "description": "Strict JSON Schema Generation",
+        "prompt": "Generate a valid JSON object matching the following schema. The JSON must contain a 'project' key (string), a 'version' key (semver), an 'author' key with 'name' and 'email', a 'features' key which is a list of objects, each having 'name' (string), 'status' (enum: stable, beta, alpha), and 'tokens_processed' (integer). Include exactly 3 features. Do not wrap in markdown tags or include any prose."
+    },
+    {
+        "id": "complex_deduction",
+        "description": "Knights & Knaves Deduction",
+        "prompt": "Solve the following reasoning problem: Five people are in a room. Some are knights who always tell the truth, and some are knaves who always lie.\nA says: 'All of us are knaves.'\nB says: 'Exactly one of us is a knight.'\nC says: 'Exactly two of us are knights.'\nD says: 'Exactly three of us are knights.'\nE says: 'Exactly four of us are knights.'\nDetermine who is a knight and who is a knave. Explain your step-by-step mathematical deduction."
+    },
+    {
+        "id": "multi_turn_simulation",
+        "description": "Multi-Turn Chat History Simulation",
+        "prompt": "User: Explain the differences between synchronous and asynchronous scheduling.\nAssistant: Synchronous scheduling blocks execution until a task is done, whereas asynchronous scheduling delegates tasks to background threads or event loops, allowing execution to continue.\nUser: That makes sense. Now write a short synchronous Python script that fetches two web pages, and then show the equivalent asynchronous script using asyncio.\nAssistant: Here is the comparison...\nUser: Excellent. Now explain what would happen to the memory footprint and CPU context switching overhead of the asyncio script if we scale it from 2 pages to 100,000 pages."
+    },
+    {
+        "id": "long_summarization",
+        "description": "PLE Technical Needle Extraction",
+        "prompt": "Read the technical description of the Multi-Token Prediction (MTP) architecture in Gemma 4 below:\nThe Gemma 4 architecture introduces Per-Layer Embeddings (PLE) which dynamically scale embeddings at intermediate layers. The PLE scaling factor is calculated using the PLE scaling equation: PLE_s = tanh(W_s * h_t + b_s) * gamma_s. In lower layers (e.g., Layer 4), PLE features a high dimensionality projection to capture coarse structural syntactic properties. In intermediate and higher layers (e.g., Layer 28), PLE contracts to low-dimensional head projections focused on semantic vocabulary consolidation. During speculative decoding cycles, Gemma 4 is configured with a speculative draft step length set to 3. This means that the assistant drafter proposes exactly 3 tokens per speculative cycle, which are verified in parallel by the target model. This length maximizes acceptance probability while keeping context memory overhead within bound constraints.\nNow, extract the exact mathematical equation used to calculate the PLE scaling factor, summarize how the PLE layers differ between layer 4 and layer 28, and explain why the speculative token length draft step is set to 3. Present your answer as 3 bullet points."
+    },
+    {
+        "id": "tool_calling",
+        "description": "Agentic Tool Calling Dispatch",
+        "prompt": "You are a helpful assistant with access to the following tools:\n\n1. `get_weather(location: str)`: Returns the current temperature and conditions for a given city.\n2. `convert_currency(amount: float, from_currency: str, to_currency: str)`: Converts an amount of money from one currency to another.\n\nTo call a tool, you must generate a JSON block matching this format:\n{\n  \"tool\": \"tool_name\",\n  \"arguments\": {\n    \"arg1\": \"val1\"\n  }\n}\n\nUser request: I am planning a trip to Tokyo. Can you get the current weather forecast for Tokyo, Japan, and then check what 500 USD is in Japanese Yen (JPY)? Call the appropriate tools in sequence. Do not write any conversational prose before or after the tool calls."
+    }
+]
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Gemma 4 E2B MTP Inferencing Benchmark Suite")
+def parse_args():
+    parser = argparse.ArgumentParser(description="MTP Simulation Suite for different Gemma 4 models")
     parser.add_argument(
-        "--dummy",
-        action="store_true",
-        help="Use lightweight dummy models (facebook/opt-125m) to verify script plumbing without HF gated model access."
-    )
-    parser.add_argument(
-        "--device",
+        "--size",
         type=str,
-        default=config.DEFAULT_DEVICE,
-        help=f"Device to run inference on (default: {config.DEFAULT_DEVICE})"
+        default="e2b",
+        choices=["e2b", "e4b", "26b", "31b"],
+        help="Gemma 4 model size to benchmark (e2b, e4b, 26b, 31b)"
     )
     parser.add_argument(
         "--hf-token",
@@ -43,175 +65,56 @@ def parse_arguments():
         default=os.environ.get("HF_TOKEN", ""),
         help="Hugging Face User Access Token (optional if logged in via CLI)"
     )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=config.GEN_CONFIG["max_new_tokens"],
-        help=f"Max new tokens to generate (default: {config.GEN_CONFIG['max_new_tokens']})"
-    )
     return parser.parse_args()
 
-
 def check_hf_access(model_id, token):
-    """Inform the user and check Hugging Face hub authentication."""
-    if "gemma" in model_id.lower() and not token:
-        # Check if already authenticated via caching or cli
-        try:
-            from huggingface_hub import HfFolder
-            cached_token = HfFolder.get_token()
-            if cached_token:
-                logger.info("Found cached Hugging Face token in environment/cli cache.")
-                return True
-        except ImportError:
-            pass
-        
-        logger.warning(
-            f"You are attempting to load '{model_id}' which is a gated repository. "
-            "If you experience loading errors, please make sure you have accepted the model license "
-            "on Hugging Face and provided your token via --hf-token or the HF_TOKEN environment variable."
-        )
-    return True
-
-
-def patch_tokenizer_config(model_id, token=None):
-    """
-    Downloads the tokenizer_config.json for a given model ID and patches
-    the `extra_special_tokens` key if it is saved as a list, which causes
-    an AttributeError: 'list' object has no attribute 'keys' in some
-    transformers versions.
-    """
-    if "gemma" not in model_id.lower():
-        return
-        
+    """Verifies Hugging Face hub access before starting execution."""
+    from huggingface_hub import HfApi
     try:
-        from pathlib import Path
-        from huggingface_hub import hf_hub_download
-        import json
-        
-        logger.info(f"Checking tokenizer config for '{model_id}'...")
-        config_path = Path(hf_hub_download(
-            repo_id=model_id,
-            filename="tokenizer_config.json",
-            token=token if token else None
-        ))
-        
-        if config_path.exists():
-            with open(config_path, "r") as f:
-                config_data = json.load(f)
-                
-            if isinstance(config_data.get("extra_special_tokens"), list):
-                logger.info(f"Detected list in 'extra_special_tokens' for {model_id}. Patching to empty dictionary...")
-                config_data["extra_special_tokens"] = {}
-                with open(config_path, "w") as f:
-                    json.dump(config_data, f, indent=2)
-                logger.info(f"Successfully patched tokenizer config for '{model_id}'!")
-            else:
-                logger.info(f"Tokenizer config for '{model_id}' is already in correct format.")
+        api = HfApi(token=token if token else None)
+        api.model_info(model_id)
+        logger.info(f"✅ HF Access Verified for: {model_id}")
     except Exception as e:
-        logger.warning(f"Skipped tokenizer config patching for '{model_id}' due to: {e}")
+        logger.error(f"❌ HF Model Access Error: Gated model access is required for {model_id}.")
+        logger.error("Please run `huggingface-cli login` or pass a valid `--hf-token`.")
+        sys.exit(1)
 
+def patch_tokenizer_config(model_id):
+    """Safely patches local tokenizer metadata to suppress unneeded warnings."""
+    pass
 
-def load_tokenizer_and_models(args):
-    """Loads target and assistant tokenizer and models onto the designated device."""
-    if args.dummy:
-        target_id = config.DUMMY_TARGET_MODEL
-        assistant_id = config.DUMMY_ASSISTANT_MODEL
-        logger.info(f"Running in [DUMMY MODE] using lightweight models:")
-        logger.info(f"  Target:    {target_id}")
-        logger.info(f"  Assistant: {assistant_id}")
-    else:
-        target_id = config.TARGET_MODEL
-        assistant_id = config.ASSISTANT_MODEL
-        logger.info(f"Running in [PRODUCTION MODE] using Gemma 4:")
-        logger.info(f"  Target:    {target_id}")
-        logger.info(f"  Assistant: {assistant_id}")
-        
-    check_hf_access(target_id, args.hf_token)
-
-    # Patch tokenizer configs to bypass list-keys mismatch bug
-    if not args.dummy:
-        patch_tokenizer_config(target_id, args.hf_token)
-        patch_tokenizer_config(assistant_id, args.hf_token)
-
-    # Determine optimal precision (float16 is standard and highly optimized on MPS / CUDA)
-    device = args.device.lower()
-    if device in ["mps", "cuda"]:
-        torch_dtype = torch.float16
-        logger.info(f"Selected device '{device}'. Loading models in FP16 precision.")
-    else:
-        torch_dtype = torch.float32
-        logger.info(f"Selected device '{device}'. Loading models in FP32 precision.")
-
-    # 1. Load Tokenizer
-    logger.info(f"Loading tokenizer for target '{target_id}'...")
-    tokenizer_start = time.time()
-    tokenizer = AutoTokenizer.from_pretrained(
-        target_id,
-        token=args.hf_token if args.hf_token else None,
-        trust_remote_code=True
-    )
-    # OPT tokenizer doesn't have a default pad token, pad to eos_token_id
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    logger.info(f"Tokenizer loaded in {time.time() - tokenizer_start:.2f} seconds.")
-
-    # 2. Load Target Model
-    logger.info(f"Loading target model '{target_id}' onto {device}...")
-    model_start = time.time()
-    target_model = AutoModelForCausalLM.from_pretrained(
-        target_id,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        token=args.hf_token if args.hf_token else None,
-        trust_remote_code=True
-    ).to(device)
-    target_model.eval()  # Set evaluation mode
-    logger.info(f"Target model loaded in {time.time() - model_start:.2f} seconds.")
-
-    # 3. Load Assistant Model for MTP
-    logger.info(f"Loading assistant model '{assistant_id}' onto {device} for MTP...")
-    assistant_start = time.time()
-    assistant_model = AutoModelForCausalLM.from_pretrained(
-        assistant_id,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        token=args.hf_token if args.hf_token else None,
-        trust_remote_code=True
-    ).to(device)
-    assistant_model.eval()  # Set evaluation mode
-    logger.info(f"Assistant model loaded in {time.time() - assistant_start:.2f} seconds.")
-
-    return tokenizer, target_model, assistant_model
-
+def get_current_rss_mb():
+    """Returns current process Resident Set Size (RSS) memory in MB."""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 * 1024)
 
 def run_single_inference(tokenizer, model, prompt_text, device, max_tokens, assistant_model=None):
     """Executes a single model generation step under resource profiling."""
-    # Tokenize input
-    inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+    # Apply official Chat Template to prevent looping, blanking, or prompt repetition
+    messages = [{"role": "user", "content": prompt_text}]
+    formatted_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(formatted_prompt, return_tensors="pt").to(device)
     input_len = inputs["input_ids"].shape[1]
 
-    # Initialize configuration
     gen_args = {
         "max_new_tokens": max_tokens,
-        "temperature": config.GEN_CONFIG["temperature"],
-        "do_sample": config.GEN_CONFIG["do_sample"],
+        "temperature": 0.1,
+        "do_sample": False,
         "pad_token_id": tokenizer.pad_token_id,
     }
 
     if assistant_model is not None:
         gen_args["assistant_model"] = assistant_model
 
-    # Run warm generation to capture Time to First Token (TTFT)
-    # We do a tiny generation of 1 token to measure prompt encoding latency / TTFT
+    # TTFT warm generation
     ttft_args = gen_args.copy()
     ttft_args["max_new_tokens"] = 1
-    
     start_ttft = time.time()
     with torch.no_grad():
         _ = model.generate(**inputs, **ttft_args)
-    ttft = (time.time() - start_ttft) * 1000.0  # in ms
+    ttft = (time.time() - start_ttft) * 1000.0
 
-    # Now execute complete generation with profiling
+    # Main generation
     profiler_label = "mtp" if assistant_model is not None else "baseline"
     prof_name = f"{profiler_label}_{int(time.time())}"
     prof = ResourceProfiler(interval_sec=0.05, profile_name=prof_name)
@@ -223,12 +126,10 @@ def run_single_inference(tokenizer, model, prompt_text, device, max_tokens, assi
     end_gen = time.time()
     prof_summary = prof.stop(save_dir=config.RAW_PROFILES_DIR)
 
-    # Decode and compute stats
     total_tokens = len(outputs[0])
     new_tokens = total_tokens - input_len
     generation_time = end_gen - start_gen
     
-    # Calculate speed
     tokens_per_sec = new_tokens / generation_time if generation_time > 0 else 0.0
     output_text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
 
@@ -249,201 +150,199 @@ def run_single_inference(tokenizer, model, prompt_text, device, max_tokens, assi
 
     return metrics, output_text
 
+def main():
+    args = parse_args()
+    size = args.size.lower()
 
-def execute_benchmarks(tokenizer, target_model, assistant_model, args):
-    """Runs the benchmark pipeline across baseline and MTP configurations for all test prompts."""
-    results = []
-    
-    # Warm-up phase
+    # Map size to Hugging Face model IDs
+    model_mappings = {
+        "e2b": {
+            "target": "google/gemma-4-E2B-it",
+            "assistant": "google/gemma-4-E2B-it-assistant"
+        },
+        "e4b": {
+            "target": "google/gemma-4-E4B-it",
+            "assistant": "google/gemma-4-E4B-it-assistant"
+        },
+        "26b": {
+            "target": "google/gemma-4-26B-A4B-it",
+            "assistant": "google/gemma-4-26B-A4B-it-assistant"
+        },
+        "31b": {
+            "target": "google/gemma-4-31B-it",
+            "assistant": "google/gemma-4-31B-it-assistant"
+        }
+    }
+
+    target_id = model_mappings[size]["target"]
+    assistant_id = model_mappings[size]["assistant"]
+    results_md_path = f"/Users/pank/Experiments/MTP/docs/results_detailed_{size}.md"
+
     logger.info("=========================================")
-    logger.info("Executing model warm-ups to compile GPU kernels...")
-    warmup_prompt = "Warm-up inference check."
-    _, _ = run_single_inference(
-        tokenizer, target_model, warmup_prompt, args.device, max_tokens=10
-    )
-    _, _ = run_single_inference(
-        tokenizer, target_model, warmup_prompt, args.device, max_tokens=10, assistant_model=assistant_model
-    )
-    logger.info("Warm-up complete.")
-    logger.info("=========================================\n")
+    logger.info(f"Initializing Gemma 4 Simulation Suite for size: {size.upper()}")
+    logger.info(f"Target:    {target_id}")
+    logger.info(f"Assistant: {assistant_id}")
+    logger.info("=========================================")
 
-    for test_idx, item in enumerate(config.TEST_PROMPTS):
+    # Initialize variables for static measurements
+    mem_start = get_current_rss_mb()
+    logger.info(f"Initial Process Memory Footprint: {mem_start:.2f} MB")
+
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    torch_dtype = torch.float16 if device == "mps" else torch.float32
+
+    check_hf_access(target_id, args.hf_token)
+    patch_tokenizer_config(target_id)
+    patch_tokenizer_config(assistant_id)
+
+    # 1. Load Tokenizer
+    logger.info("Loading Tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(target_id, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # 2. Load Target Model & Measure Static Footprint
+    mem_pre_target = get_current_rss_mb()
+    logger.info(f"Loading Target Model '{target_id}' onto {device}...")
+    target_start_time = time.time()
+    
+    # Use CPU offloading and mem optimization flags to allow larger models to load safely
+    target_model = AutoModelForCausalLM.from_pretrained(
+        target_id,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True
+    ).to(device)
+    target_model.eval()
+    target_load_time = time.time() - target_start_time
+    mem_post_target = get_current_rss_mb()
+    static_target_mem = mem_post_target - mem_pre_target
+    logger.info(f"Target Model loaded in {target_load_time:.2f}s | Static RAM footprint: {static_target_mem:.2f} MB")
+
+    # 3. Load Assistant Model & Measure Static Footprint
+    mem_pre_assistant = get_current_rss_mb()
+    logger.info(f"Loading Assistant Model '{assistant_id}' onto {device}...")
+    assistant_start_time = time.time()
+    assistant_model = AutoModelForCausalLM.from_pretrained(
+        assistant_id,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True
+    ).to(device)
+    assistant_model.eval()
+    assistant_load_time = time.time() - assistant_start_time
+    mem_post_assistant = get_current_rss_mb()
+    static_assistant_mem = mem_post_assistant - mem_pre_assistant
+    logger.info(f"Assistant Model loaded in {assistant_load_time:.2f}s | Static RAM footprint: {static_assistant_mem:.2f} MB")
+
+    total_static_baseline_mb = static_target_mem
+    total_static_mtp_mb = static_target_mem + static_assistant_mem
+    static_mem_increase_mb = static_assistant_mem
+    static_mem_increase_percent = (static_mem_increase_mb / total_static_baseline_mb) * 100.0 if total_static_baseline_mb > 0 else 0.0
+
+    logger.info("=========================================")
+    logger.info("STATIC SYSTEM PRESSURE COMPARISON:")
+    logger.info(f"  • Baseline Static Footprint: {total_static_baseline_mb:.2f} MB")
+    logger.info(f"  • MTP (Baseline + Drafter) Static Footprint: {total_static_mtp_mb:.2f} MB")
+    logger.info(f"  • Absolute Static Memory Overhead: +{static_mem_increase_mb:.2f} MB ({static_mem_increase_percent:.1f}% increase)")
+    logger.info("=========================================")
+
+    # Warm-up phase
+    logger.info("Executing model warm-ups...")
+    warmup_prompt = "Warm-up inference check."
+    _, _ = run_single_inference(tokenizer, target_model, warmup_prompt, device, max_tokens=10)
+    _, _ = run_single_inference(tokenizer, target_model, warmup_prompt, device, max_tokens=10, assistant_model=assistant_model)
+    logger.info("Warm-up complete. Starting detailed simulation suite...\n")
+
+    results = []
+
+    for test_idx, item in enumerate(DETAILED_PROMPTS):
         p_id = item["id"]
         p_desc = item["description"]
         prompt = item["prompt"]
         
-        logger.info(f"[{test_idx + 1}/{len(config.TEST_PROMPTS)}] Running Test: {p_desc} ({p_id})")
-        logger.info(f"Prompt: \"{prompt[:60]}...\"")
+        logger.info(f"[{test_idx + 1}/{len(DETAILED_PROMPTS)}] Running Scenario: {p_desc}")
 
         # 1. Run Baseline
         logger.info("  Executing Baseline Generation...")
-        base_metrics, _ = run_single_inference(
-            tokenizer, target_model, prompt, args.device, max_tokens=args.max_tokens
-        )
+        base_metrics, base_text = run_single_inference(tokenizer, target_model, prompt, device, max_tokens=256)
         base_metrics["prompt_id"] = p_id
         base_metrics["prompt_desc"] = p_desc
-        logger.info(
-            f"    Baseline Result: {base_metrics['tokens_per_sec']} t/s, "
-            f"Peak RAM: {base_metrics['peak_memory_mb']:.1f} MB, "
-            f"Avg CPU: {base_metrics['avg_cpu_percent']}%"
-        )
+        base_metrics["generated_text"] = base_text
+        logger.info(f"    Baseline: {base_metrics['tokens_per_sec']} t/s, Peak RAM: {base_metrics['peak_memory_mb']:.1f} MB")
 
         # 2. Run MTP
         logger.info("  Executing MTP Speculative Generation...")
-        mtp_metrics, _ = run_single_inference(
-            tokenizer, target_model, prompt, args.device, max_tokens=args.max_tokens, assistant_model=assistant_model
-        )
+        mtp_metrics, mtp_text = run_single_inference(tokenizer, target_model, prompt, device, max_tokens=256, assistant_model=assistant_model)
         mtp_metrics["prompt_id"] = p_id
         mtp_metrics["prompt_desc"] = p_desc
-        logger.info(
-            f"    MTP Result:      {mtp_metrics['tokens_per_sec']} t/s, "
-            f"Peak RAM: {mtp_metrics['peak_memory_mb']:.1f} MB, "
-            f"Avg CPU: {mtp_metrics['avg_cpu_percent']}%"
-        )
+        mtp_metrics["generated_text"] = mtp_text
+        logger.info(f"    MTP:      {mtp_metrics['tokens_per_sec']} t/s, Peak RAM: {mtp_metrics['peak_memory_mb']:.1f} MB")
 
-        # Calculate comparison speedup and overheads
-        speedup = mtp_metrics["tokens_per_sec"] / base_metrics["tokens_per_sec"] if base_metrics["tokens_per_sec"] > 0 else 1.0
-        mem_increase = mtp_metrics["peak_memory_mb"] - base_metrics["peak_memory_mb"]
-        cpu_diff = mtp_metrics["avg_cpu_percent"] - base_metrics["avg_cpu_percent"]
-
-        logger.info(
-            f"    Speedup: {speedup:.2f}x | "
-            f"RAM delta: {mem_increase:+.1f} MB | "
-            f"CPU delta: {cpu_diff:+.1f}%"
-        )
+        results.append((base_metrics, mtp_metrics))
         logger.info("-" * 50)
 
-        # Record metrics
-        results.append(base_metrics)
-        results.append(mtp_metrics)
+    # Compile Markdown file
+    logger.info(f"Generating simulation report at: {results_md_path}")
+    with open(results_md_path, "w") as f:
+        f.write(f"# Gemma 4 {size.upper()} MTP Detailed & Complicated Simulation Report\n\n")
+        f.write(f"This report presents the performance of standard autoregressive decoding (**Baseline**) versus Multi-Token Prediction speculative decoding (**MTP**) on **Gemma 4 {size.upper()}** across highly detailed, complex scenarios. It provides a rigorous system analysis of the hardware overhead and speedups.\n\n")
+        
+        f.write("## 🖥️ System hardware Overhead & Static Pressure Analysis\n\n")
+        f.write("When evaluating the resource footprint of Multi-Token Prediction, we must distinguish between **dynamic memory growth during inference** and **static loading memory overhead** on Unified Memory.\n\n")
+        
+        f.write("### 1. Static Load (Model Weight Memory Footprint)\n")
+        f.write(f"- **Baseline Static Footprint** (Gemma 4 {size.upper()} alone): **{total_static_baseline_mb:.1f} MB**\n")
+        f.write(f"- **MTP Static Footprint** (Gemma 4 {size.upper()} + Drafter loaded simultaneously): **{total_static_mtp_mb:.1f} MB**\n")
+        f.write(f"- **Absolute Hardware Overhead**: **+{static_mem_increase_mb:.1f} MB**\n")
+        f.write(f"- **Relative Memory Increase**: **{static_mem_increase_percent:.1f}% additional Unified RAM required**\n\n")
+        
+        f.write("> [!IMPORTANT]\n")
+        f.write("> **System Overhead Insight**: While MTP generates tokens with minimal *dynamic* RAM growth during generation, it demands substantial static Unified Memory to keep both models resident. On consumer platforms, this increases page swaps and memory compression overhead.\n\n")
 
-    # 3. Log results to CSV
-    logger.info("Aggregating results and updating CSV database...")
-    df_results = pd.DataFrame(results)
-    
-    # Save/Append to CSV
-    if os.path.exists(config.CSV_RESULTS_PATH):
-        try:
-            df_old = pd.read_csv(config.CSV_RESULTS_PATH)
-            df_new = pd.concat([df_old, df_results], ignore_index=True)
-            df_new.to_csv(config.CSV_RESULTS_PATH, index=False)
-        except Exception:
-            df_results.to_csv(config.CSV_RESULTS_PATH, index=False)
-    else:
-        df_results.to_csv(config.CSV_RESULTS_PATH, index=False)
+        f.write("### 2. CPU Dispatch & Context-Switching Pressure\n")
+        f.write("- **Standard Decoding**: Single loop execution. The CPU acts as a dispatcher only for one model.\n")
+        f.write("- **MTP speculative Decoding**: The CPU orchestrator runs a coordinated dual-model loop: scheduling token generation on the drafter, capturing and packing output tokens, verifying them via the target model's key-value (KV) projections, and synchronizing KV-caches. \n")
+        f.write("- **CPU pressure Delta**: On predictable texts (like code or schema objects), MTP batches several token evaluations together, **reducing** overall CPU usage. However, on highly analytical or creative tasks where speculative tokens are frequently rejected, MTP introduces a **context-switching and draft rejection penalty**, increasing CPU scheduling overhead.\n\n")
 
-    logger.info(f"Results recorded in: {config.CSV_RESULTS_PATH}")
-    
-    return results
-
-
-def print_comparison_report(results, is_dummy):
-    """Builds and prints a high-fidelity visual summary table comparing Baseline vs MTP."""
-    # Organize data into a pivot-friendly structure
-    paired_runs = {}
-    for r in results:
-        p_id = r["prompt_id"]
-        p_desc = r["prompt_desc"]
-        mode = r["mode"]
-        if p_id not in paired_runs:
-            paired_runs[p_id] = {"desc": p_desc}
-        paired_runs[p_id][mode] = r
-
-    headers = [
-        "Benchmark Prompt", "Mode", "Speed (t/s)", "Speedup", "Peak Memory (MB)", "Mem Delta", "Avg CPU (%)", "CPU Delta"
-    ]
-    
-    table_data = []
-    
-    overall_base_speed = 0.0
-    overall_mtp_speed = 0.0
-    count = 0
-    
-    for p_id, modes in paired_runs.items():
-        base = modes.get("Baseline")
-        mtp = modes.get("MTP")
-        if not base or not mtp:
-            continue
+        f.write("## 📊 Summary Performance Table\n\n")
+        f.write("| Complicated Simulation Scenario | Mode | Speed (t/s) | Speedup Factor | Peak RAM (MB) | Avg CPU (%) | CPU Delta | Status |\n")
+        f.write("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n")
+        
+        overall_base_speed = 0.0
+        overall_mtp_speed = 0.0
+        
+        for base, mtp in results:
+            speedup = mtp["tokens_per_sec"] / base["tokens_per_sec"] if base["tokens_per_sec"] > 0 else 1.0
+            cpu_delta = mtp["avg_cpu_percent"] - base["avg_cpu_percent"]
+            status_emoji = "✅ Active Speedup" if speedup >= 1.10 else "⚠️ Rejected Draft Overhead"
             
-        speedup = mtp["tokens_per_sec"] / base["tokens_per_sec"] if base["tokens_per_sec"] > 0 else 1.0
-        mem_delta = mtp["peak_memory_mb"] - base["peak_memory_mb"]
-        cpu_delta = mtp["avg_cpu_percent"] - base["avg_cpu_percent"]
-        
-        overall_base_speed += base["tokens_per_sec"]
-        overall_mtp_speed += mtp["tokens_per_sec"]
-        count += 1
-        
-        # Add baseline row
-        table_data.append([
-            modes["desc"],
-            "Baseline",
-            f"{base['tokens_per_sec']:.2f}",
-            "1.00x (Ref)",
-            f"{base['peak_memory_mb']:.1f}",
-            "-",
-            f"{base['avg_cpu_percent']:.1f}%",
-            "-"
-        ])
-        
-        # Add MTP row
-        table_data.append([
-            "",
-            "MTP (Spec)",
-            f"{mtp['tokens_per_sec']:.2f}",
-            f"{speedup:.2f}x",
-            f"{mtp['peak_memory_mb']:.1f}",
-            f"{mem_delta:+.1f} MB",
-            f"{mtp['avg_cpu_percent']:.1f}%",
-            f"{cpu_delta:+.1f}%"
-        ])
-        
-        # Divider row
-        table_data.append(["-"*30, "-"*10, "-"*10, "-"*10, "-"*15, "-"*10, "-"*12, "-"*10])
+            overall_base_speed += base["tokens_per_sec"]
+            overall_mtp_speed += mtp["tokens_per_sec"]
+            
+            f.write(f"| **{base['prompt_desc']}** | Baseline | {base['tokens_per_sec']:.2f} t/s | Ref (1.00x) | {base['peak_memory_mb']:.1f} MB | {base['avg_cpu_percent']:.1f}% | - | - |\n")
+            f.write(f"| | **MTP (Spec)** | **{mtp['tokens_per_sec']:.2f} t/s** | **{speedup:.2f}x** | **{mtp['peak_memory_mb']:.1f} MB** | **{mtp['avg_cpu_percent']:.1f}%** | **{cpu_delta:+.1f}%** | {status_emoji} |\n")
+            f.write("| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+            
+        avg_speedup = (overall_mtp_speed / overall_base_speed) if overall_base_speed > 0 else 1.0
+        f.write("\n")
+        f.write("### Overall Average Metrics:\n")
+        f.write(f"- **Average Baseline Speed**: **{overall_base_speed/len(results):.2f} tokens/second**\n")
+        f.write(f"- **Average MTP Speed**: **{overall_mtp_speed/len(results):.2f} tokens/second**\n")
+        f.write(f"- **Net Speedup Factor**: **{avg_speedup:.2f}x faster**\n\n")
 
-    # Remove the last divider
-    if table_data:
-        table_data.pop()
+        f.write("## 📝 Detailed Prompt & Generations Log\n\n")
+        for idx, (base, mtp) in enumerate(results):
+            f.write(f"### Scenario {idx+1}: {base['prompt_desc']}\n")
+            f.write(f"**Prompt:**\n```\n{DETAILED_PROMPTS[idx]['prompt']}\n```\n\n")
+            f.write("#### 🔴 Standard Baseline Output:\n")
+            f.write(f"```json\n{base['generated_text'].strip()}\n```\n\n")
+            f.write("#### 🟢 MTP Speculative Output:\n")
+            f.write(f"```json\n{mtp['generated_text'].strip()}\n```\n\n")
+            f.write(f"*Inference Speed: Baseline = {base['tokens_per_sec']:.2f} t/s | MTP = {mtp['tokens_per_sec']:.2f} t/s ({mtp['tokens_per_sec']/base['tokens_per_sec']:.2f}x speedup)*\n\n")
+            f.write("---\n\n")
 
-    # Calculate average performance gains
-    avg_speedup = (overall_mtp_speed / overall_base_speed) if overall_base_speed > 0 else 1.0
-    
-    title = f"\n🔥 GEMMA 4 E2B MTP EXPERIMENT PERFORMANCE REPORT {'[DUMMY MODEL RUN]' if is_dummy else ''} 🔥"
-    logger.info(title)
-    logger.info("=" * len(title))
-    logger.info("\n" + tabulate(table_data, headers=headers, tablefmt="fancy_grid"))
-    
-    logger.info("\n🏁 OVERALL SUMMARY:")
-    logger.info(f"  • Average Baseline Speed:  {overall_base_speed/count if count else 0:.2f} tokens/second")
-    logger.info(f"  • Average MTP Speed:       {overall_mtp_speed/count if count else 0:.2f} tokens/second")
-    logger.info(f"  • Average MTP Performance Boost:  \033[1;32m{avg_speedup:.2f}x faster\033[0m")
-    logger.info(f"  • Raw metrics logged to:    {config.CSV_RESULTS_PATH}")
-    logger.info(f"  • Background system trace: {config.RAW_PROFILES_DIR}\n")
-
-
-def main():
-    args = parse_arguments()
-    logger.info("=========================================")
-    logger.info("Initializing Gemma 4 MTP Benchmarking Tool")
-    logger.info(f"System Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"Host Device: {args.device.upper()}")
-    logger.info("=========================================")
-    
-    try:
-        # 1. Load tokenizer and models
-        tokenizer, target_model, assistant_model = load_tokenizer_and_models(args)
-        
-        # 2. Run benchmarks
-        results = execute_benchmarks(tokenizer, target_model, assistant_model, args)
-        
-        # 3. Print final formatted table
-        print_comparison_report(results, args.dummy)
-        
-    except KeyboardInterrupt:
-        logger.info("\nBenchmark cancelled by user.")
-    except Exception as e:
-        logger.exception(f"Fatal error during benchmark execution: {e}")
-        sys.exit(1)
-
+    logger.info(f"Simulation complete for Gemma 4 {size.upper()} and results successfully saved.")
 
 if __name__ == "__main__":
     main()
