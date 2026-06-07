@@ -94,40 +94,57 @@ This suite utilizes an explicit two-stage workflow to prevent accidental downloa
 #### 📦 Step 1: Download & Cache Model Weights
 To download and cache a specific model and its assistant drafter explicitly using a model tag (e.g. `gemma4:e2b`):
 
+##### PyTorch Models
 ```bash
-# Explicitly download E2B models (target & assistant)
+# Explicitly download E2B PyTorch models (target & assistant)
 venv/bin/python download_model.py gemma4:e2b
 
-# Explicitly download E4B models
+# Explicitly download E4B PyTorch models
 venv/bin/python download_model.py gemma4:e4b
+```
+
+##### Native MLX Models (Apple Silicon)
+To download pre-converted MLX models from the community repository:
+```bash
+# Explicitly download E2B MLX models
+venv/bin/python download_model.py gemma4:e2b --mlx
+
+# Explicitly download E4B MLX models
+venv/bin/python download_model.py gemma4:e4b --mlx
 ```
 *Note: If downloading a model fails or is aborted midway, the benchmarking scripts will detect the incomplete cache files and ask you to re-run the download script instead of crashing.*
 
 ---
 
 #### ⚡ Step 2: Run the Offline Benchmarks
-The benchmarking runners operate **fully offline** (`local_files_only=True`) and make zero network calls. They will only run if the target and assistant models are fully cached.
+The benchmarking runners operate **fully offline** (`local_files_only=True` / direct local cache reads) and make zero network calls. They will only run if the models are fully cached.
 
+##### A. Running PyTorch Benchmarks (MPS Acceleration)
 By default, the runner uses standard **16-bit precision** (`--bits 16`). To run in memory-efficient **4-bit weight-quantized mode** using Hugging Face's `optimum-quanto` library, specify `--bits 4`.
 
-##### A. Running a Single Model Benchmark
-To run a specific model at a specific quantization level (e.g., E2B in 4-bit):
-
 ```bash
-# Runs E2B in 4-bit quantized mode (drastically reducing Unified RAM requirements)
+# Run standalone E2B in 4-bit quantized mode
 venv/bin/python run_benchmark.py gemma4:e2b --bits 4
 
-# Runs E2B in standard 16-bit mode
+# Run standalone E2B in standard 16-bit mode
 venv/bin/python run_benchmark.py gemma4:e2b --bits 16
-```
-*If a model size is not cached, the script will exit with a descriptive warning telling you to run the download script first.*
 
-##### B. Running the Automated Sequential Pipeline
-To run the full sequential benchmark pipeline across all supported Gemma 4 models (`e2b` ➡️ `e4b` ➡️ `26b` ➡️ `31b`) automatically in 4-bit:
+# Run automated sequential PyTorch benchmarks across cached models
+venv/bin/python run_sequential_benchmarks.py --bits 16 --sizes e2b,e4b
+```
+
+##### B. Running Native MLX Benchmarks (Metal Shaders)
+MLX benchmarks evaluate Apple Silicon native execution (loaded directly from cache).
 
 ```bash
-# Runs the sequential orchestrator in 4-bit quantized mode
-venv/bin/python run_sequential_benchmarks.py --bits 4
+# Run standalone E2B MLX benchmark in 4-bit
+venv/bin/python mlx_run_benchmark.py gemma4:e2b --bits 4
+
+# Run standalone E2B MLX benchmark in 16-bit
+venv/bin/python mlx_run_benchmark.py gemma4:e2b --bits 16
+
+# Run automated sequential MLX benchmarks across cached models
+venv/bin/python mlx_run_sequential_benchmarks.py --bits 4 --sizes e2b,e4b
 ```
 
 > [!TIP]
@@ -136,12 +153,13 @@ venv/bin/python run_sequential_benchmarks.py --bits 4
 ---
 
 #### 📊 Step 3: Render Comparison Visualization
-To render the comparative benchmark performance bar chart:
+To render the comparative cross-framework performance bar chart (comparing PyTorch vs. MLX at both 4-bit and 16-bit precisions across all 6 scenarios):
 
 ```bash
-# Generates assets/gemma_mtp_benchmark.png
-venv/bin/python scratch/generate_chart.py
+# Generates assets/gemma_cross_framework_comparison.png
+venv/bin/python scratch/generate_mlx_pytorch_chart.py
 ```
+
 
 ---
 
