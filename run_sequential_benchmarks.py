@@ -64,7 +64,8 @@ def run_benchmark(size, bits):
         process.wait()
         
         if process.returncode == 0:
-            report_name = f"results_detailed_{size}_4bit.md" if bits == 4 else f"results_detailed_{size}.md"
+            report_name = f"pytorch_results_detailed_{size}_4bit.md" if bits == 4 else f"pytorch_results_detailed_{size}.md"
+
             logger.info(f"✅ SUCCESS: Benchmark for Gemma 4 {size.upper()} completed successfully!")
             logger.info(f"Report written to: docs/{report_name}")
         else:

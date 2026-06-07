@@ -292,9 +292,10 @@ def main():
     assistant_id = model_mappings[size]["assistant"]
     
     if bits == 4:
-        results_md_path = f"/Users/pank/Experiments/MTP/docs/results_detailed_{size}_4bit.md"
+        results_md_path = f"/Users/pank/Experiments/MTP/docs/pytorch_results_detailed_{size}_4bit.md"
     else:
-        results_md_path = f"/Users/pank/Experiments/MTP/docs/results_detailed_{size}.md"
+        results_md_path = f"/Users/pank/Experiments/MTP/docs/pytorch_results_detailed_{size}.md"
+
 
     logger.info("=========================================")
     logger.info(f"Initializing Gemma 4 Simulation Suite for size: {size.upper()} ({bits}-bit)")
