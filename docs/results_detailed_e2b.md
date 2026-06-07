@@ -1,16 +1,16 @@
-# Gemma 4 E2B MTP Detailed & Complicated Simulation Report
+# Gemma 4 E2B MTP Detailed & Complicated Simulation Report (16-Bit Precision)
 
-This report presents the performance of standard autoregressive decoding (**Baseline**) versus Multi-Token Prediction speculative decoding (**MTP**) on **Gemma 4 E2B** across highly detailed, complex scenarios. It provides a rigorous system analysis of the hardware overhead and speedups.
+This report presents the performance of standard autoregressive decoding (**Baseline**) versus Multi-Token Prediction speculative decoding (**MTP**) on **Gemma 4 E2B** (loaded in **16-Bit Precision** via optimum-quanto) across highly detailed, complex scenarios. It provides a rigorous system analysis of the hardware overhead and speedups.
 
 ## 🖥️ System hardware Overhead & Static Pressure Analysis
 
 When evaluating the resource footprint of Multi-Token Prediction, we must distinguish between **dynamic memory growth during inference** and **static loading memory overhead** on Unified Memory.
 
 ### 1. Static Load (Model Weight Memory Footprint)
-- **Baseline Static Footprint** (Gemma 4 E2B alone): **734.0 MB**
-- **MTP Static Footprint** (Gemma 4 E2B + Drafter loaded simultaneously): **836.2 MB**
-- **Absolute Hardware Overhead**: **+102.3 MB**
-- **Relative Memory Increase**: **13.9% additional Unified RAM required**
+- **Baseline Static Footprint** (Gemma 4 E2B alone): **1020.8 MB**
+- **MTP Static Footprint** (Gemma 4 E2B + Drafter loaded simultaneously): **1157.3 MB**
+- **Absolute Hardware Overhead**: **+136.5 MB**
+- **Relative Memory Increase**: **13.4% additional Unified RAM required**
 
 > [!IMPORTANT]
 > **System Overhead Insight**: While MTP generates tokens with minimal *dynamic* RAM growth during generation, it demands substantial static Unified Memory to keep both models resident. On consumer platforms, this increases page swaps and memory compression overhead.
@@ -24,26 +24,29 @@ When evaluating the resource footprint of Multi-Token Prediction, we must distin
 
 | Complicated Simulation Scenario | Mode | Speed (t/s) | Speedup Factor | Peak RAM (MB) | Avg CPU (%) | CPU Delta | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Strict JSON Schema Generation** | Baseline | 24.06 t/s | Ref (1.00x) | 2191.4 MB | 87.0% | - | - |
-| | **MTP (Spec)** | **60.32 t/s** | **2.51x** | **2436.4 MB** | **83.6%** | **-3.4%** | ✅ Active Speedup |
+| **Strict JSON Schema Generation** | Baseline | 24.39 t/s | Ref (1.00x) | 2480.1 MB | 90.2% | - | - |
+| | **MTP (Spec)** | **60.19 t/s** | **2.47x** | **2736.5 MB** | **85.2%** | **-5.1%** | ✅ Active Speedup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **Knights & Knaves Deduction** | Baseline | 26.56 t/s | Ref (1.00x) | 2710.2 MB | 86.8% | - | - |
-| | **MTP (Spec)** | **55.98 t/s** | **2.11x** | **3057.5 MB** | **83.8%** | **-3.1%** | ✅ Active Speedup |
+| **Knights & Knaves Deduction** | Baseline | 26.58 t/s | Ref (1.00x) | 3007.4 MB | 89.9% | - | - |
+| | **MTP (Spec)** | **53.28 t/s** | **2.00x** | **3364.6 MB** | **83.2%** | **-6.7%** | ✅ Active Speedup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **Multi-Turn Chat History Simulation** | Baseline | 28.38 t/s | Ref (1.00x) | 3130.6 MB | 86.9% | - | - |
-| | **MTP (Spec)** | **30.18 t/s** | **1.06x** | **3704.2 MB** | **84.4%** | **-2.5%** | ⚠️ Rejected Draft Overhead |
+| **Multi-Turn Chat History Simulation** | Baseline | 28.38 t/s | Ref (1.00x) | 3436.4 MB | 89.4% | - | - |
+| | **MTP (Spec)** | **29.46 t/s** | **1.04x** | **4010.4 MB** | **85.7%** | **-3.8%** | ⚠️ Rejected Draft Overhead |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **PLE Technical Needle Extraction** | Baseline | 25.50 t/s | Ref (1.00x) | 3822.3 MB | 84.7% | - | - |
-| | **MTP (Spec)** | **45.53 t/s** | **1.79x** | **4005.6 MB** | **82.2%** | **-2.4%** | ✅ Active Speedup |
+| **PLE Technical Needle Extraction** | Baseline | 25.68 t/s | Ref (1.00x) | 4128.8 MB | 86.8% | - | - |
+| | **MTP (Spec)** | **46.61 t/s** | **1.82x** | **4312.3 MB** | **83.6%** | **-3.2%** | ✅ Active Speedup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **Agentic Tool Calling Dispatch** | Baseline | 26.41 t/s | Ref (1.00x) | 4033.0 MB | 87.3% | - | - |
-| | **MTP (Spec)** | **69.43 t/s** | **2.63x** | **4086.9 MB** | **81.7%** | **-5.6%** | ✅ Active Speedup |
+| **Agentic Tool Calling Dispatch** | Baseline | 27.69 t/s | Ref (1.00x) | 4339.3 MB | 88.2% | - | - |
+| | **MTP (Spec)** | **62.70 t/s** | **2.26x** | **4395.8 MB** | **76.6%** | **-11.6%** | ✅ Active Speedup |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **RAG Contextual Synthesis** | Baseline | 25.53 t/s | Ref (1.00x) | 4419.7 MB | 81.7% | - | - |
+| | **MTP (Spec)** | **43.25 t/s** | **1.69x** | **4505.5 MB** | **77.1%** | **-4.6%** | ✅ Active Speedup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 
 ### Overall Average Metrics:
-- **Average Baseline Speed**: **26.18 tokens/second**
-- **Average MTP Speed**: **52.29 tokens/second**
-- **Net Speedup Factor**: **2.00x faster**
+- **Average Baseline Speed**: **26.38 tokens/second**
+- **Average MTP Speed**: **49.25 tokens/second**
+- **Net Speedup Factor**: **1.87x faster**
 
 ## 📝 Detailed Prompt & Generations Log
 
@@ -111,7 +114,7 @@ Generate a valid JSON object matching the following schema. The JSON must contai
 }
 ```
 
-*Inference Speed: Baseline = 24.06 t/s | MTP = 60.32 t/s (2.51x speedup)*
+*Inference Speed: Baseline = 24.39 t/s | MTP = 60.19 t/s (2.47x speedup)*
 
 ---
 
@@ -163,7 +166,7 @@ E says ($S_E$): "Exactly four of us are knights." (i.e., $K=4$)
 We will test each
 ```
 
-*Inference Speed: Baseline = 26.56 t/s | MTP = 55.98 t/s (2.11x speedup)*
+*Inference Speed: Baseline = 26.58 t/s | MTP = 53.28 t/s (2.00x speedup)*
 
 ---
 
@@ -221,7 +224,7 @@ The memory footprint of the `asyncio` script will generally be **significantly l
 * **Low, Predictable Memory Usage:** `asyncio` operates
 ```
 
-*Inference Speed: Baseline = 28.38 t/s | MTP = 30.18 t/s (1.06x speedup)*
+*Inference Speed: Baseline = 28.38 t/s | MTP = 29.46 t/s (1.04x speedup)*
 
 ---
 
@@ -251,7 +254,7 @@ Here are the extracted points based on the technical description:
 *   **Speculative Token Length:** The speculative token length draft step is set to 3 because this length maximizes the acceptance probability while keeping the context memory overhead within bound constraints.
 ```
 
-*Inference Speed: Baseline = 25.50 t/s | MTP = 45.53 t/s (1.79x speedup)*
+*Inference Speed: Baseline = 25.68 t/s | MTP = 46.61 t/s (1.82x speedup)*
 
 ---
 
@@ -314,7 +317,35 @@ User request: I am planning a trip to Tokyo. Can you get the current weather for
 ]
 ```
 
-*Inference Speed: Baseline = 26.41 t/s | MTP = 69.43 t/s (2.63x speedup)*
+*Inference Speed: Baseline = 27.69 t/s | MTP = 62.70 t/s (2.26x speedup)*
+
+---
+
+### Scenario 6: RAG Contextual Synthesis
+**Prompt:**
+```
+You are a factual assistant. Based ONLY on the retrieved knowledge base passages below, answer the user's question. Do not assume or extrapolate. If the context does not contain the answer, say 'I cannot answer this based on the retrieved context'.
+
+[Passage 1]
+The Nebula-9 supercluster is a high-density stellar cluster located approximately 4.2 million light-years from Earth. Discovered in 2024 by the orbital telescope Chronos, it contains over 1,200 active star-forming regions. The central star of the cluster, designated N9-Alpha, is a hypergiant with a mass equivalent to 180 solar masses. N9-Alpha exhibits intense periodic flare-ups every 14.3 Earth days, ejecting coronal mass at speeds exceeding 4,500 km/s.
+
+[Passage 2]
+Stellar navigation around the Nebula-9 supercluster is severely restricted due to high concentrations of particulate interstellar dust. According to the United Stellar Coalition Regulation 88-C, ships crossing within 50 light-years of the cluster's boundary must engage magnetic deflection shields (MDS) to prevent particle abrasion. The dust composition is uniquely high in magnesium silicate (82%) and iron oxide (12%), which creates electromagnetic interference that disrupts standard gravimetric sensors.
+
+User Question: What is the specific speed of coronal mass ejections from the central star of Nebula-9, what are the two main chemical components of the interstellar dust in the cluster, and what coalition regulation governs navigation in this region?
+```
+
+#### 🔴 Standard Baseline Output:
+```json
+The specific speed of coronal mass ejections from the central star of Nebula-9 is exceeding 4,500 km/s. The two main chemical components of the interstellar dust in the cluster are magnesium silicate (82%) and iron oxide (12%). The coalition regulation governing navigation in this region is United Stellar Coalition Regulation 88-C.
+```
+
+#### 🟢 MTP Speculative Output:
+```json
+The specific speed of coronal mass ejections from the central star of Nebula-9 is exceeding 4,500 km/s. The two main chemical components of the interstellar dust in the cluster are magnesium silicate (82%) and iron oxide (12%). The coalition regulation governing navigation in this region is United Stellar Coalition Regulation 88-C.
+```
+
+*Inference Speed: Baseline = 25.53 t/s | MTP = 43.25 t/s (1.69x speedup)*
 
 ---
 

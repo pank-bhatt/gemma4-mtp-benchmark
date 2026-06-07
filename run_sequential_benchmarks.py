@@ -1,7 +1,13 @@
 import os
 import sys
+
+# Prepend venv/bin to PATH to ensure virtual environment tools (like ninja) are visible to subprocesses
+venv_bin = os.path.abspath(os.path.join(os.path.dirname(__file__), "venv", "bin"))
+os.environ["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
+
 import subprocess
 import logging
+
 
 # Setup logging
 logging.basicConfig(
@@ -15,6 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger("SequentialOrchestrator")
 
 import argparse
+from run_benchmark import is_model_fully_cached
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Gemma 4 Multi-Model Sequential Orchestrator")
@@ -24,6 +31,12 @@ def parse_args():
         default=16,
         choices=[16, 4],
         help="Quantization level in bits (16 or 4)"
+    )
+    parser.add_argument(
+        "--sizes",
+        type=str,
+        default="e2b,e4b,26b,31b",
+        help="Comma-separated list of model sizes to benchmark (e.g., e2b,e4b)"
     )
     return parser.parse_args()
 
@@ -67,20 +80,62 @@ def main():
     args = parse_args()
     bits = args.bits
 
+    # Map size to Hugging Face model IDs to check cache
+    model_mappings = {
+        "e2b": {
+            "target": "google/gemma-4-E2B-it",
+            "assistant": "google/gemma-4-E2B-it-assistant"
+        },
+        "e4b": {
+            "target": "google/gemma-4-E4B-it",
+            "assistant": "google/gemma-4-E4B-it-assistant"
+        },
+        "26b": {
+            "target": "google/gemma-4-26B-A4B-it",
+            "assistant": "google/gemma-4-26B-A4B-it-assistant"
+        },
+        "31b": {
+            "target": "google/gemma-4-31B-it",
+            "assistant": "google/gemma-4-31B-it-assistant"
+        }
+    }
+
     logger.info(f"Starting Gemma 4 Multi-Model Sequential Benchmarking Suite ({bits}-bit)")
-    logger.info("Target Sizes: E2B -> E4B -> 26B -> 31B")
-    logger.info("Download progress will be automatically tracked in logs/models.log")
     
-    sizes = ["e2b", "e4b", "26b", "31b"]
-    
+    sizes = [s.strip().lower() for s in args.sizes.split(",") if s.strip()]
+    logger.info(f"Target Sizes: {' -> '.join([s.upper() for s in sizes])}")
+    cached_sizes = []
+
+    logger.info("Verifying local cache availability for sequential benchmark targets...")
     for size in sizes:
+        target_id = model_mappings[size]["target"]
+        assistant_id = model_mappings[size]["assistant"]
+        
+        target_cached, _ = is_model_fully_cached(target_id)
+        assistant_cached, _ = is_model_fully_cached(assistant_id)
+        
+        if target_cached and assistant_cached:
+            cached_sizes.append(size)
+        else:
+            logger.info(f"⏭️ Skipping Gemma 4 {size.upper()} (not fully cached locally).")
+            logger.info(f"    To run this benchmark, please download it first using: python download_model.py --size {size}")
+            
+    if not cached_sizes:
+        logger.error("❌ ERROR: No fully cached models were found. Please download at least one model first using: python download_model.py --size {size}")
+        sys.exit(1)
+        
+    logger.info(f"Locally available models to benchmark: {', '.join([s.upper() for s in cached_sizes])}")
+    logger.info("===========================================================")
+    
+    for size in cached_sizes:
         success = run_benchmark(size, bits)
         if not success:
             logger.warning(f"⚠️ Warning: Benchmark for size {size.upper()} did not complete successfully. Moving to next model...")
             
     logger.info("===========================================================")
-    logger.info("ALL BENCHMARKS COMPLETED!")
+    logger.info("ALL AVAILABLE SEQUENTIAL BENCHMARKS COMPLETED!")
     logger.info("===========================================================")
 
 if __name__ == "__main__":
     main()
+

@@ -1,21 +1,15 @@
 import os
 import sys
-
-# Prepend venv/bin to PATH to ensure virtual environment tools (like ninja) are visible during JIT compilation
-venv_bin = os.path.abspath(os.path.join(os.path.dirname(__file__), "venv", "bin"))
-os.environ["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
-
 import time
 import logging
-import torch
 import psutil
 import argparse
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from tabulate import tabulate
+import huggingface_hub
+import mlx.core as mx
+import mlx_lm
 
 import config
 from profiler import ResourceProfiler
-
 
 # Setup logging
 logging.basicConfig(
@@ -23,10 +17,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(os.path.join(config.LOG_DIR, "execution.log"), mode="a")
+        logging.FileHandler(os.path.join(config.LOG_DIR, "mlx_execution.log"), mode="a")
     ]
 )
-logger = logging.getLogger("Benchmark")
+logger = logging.getLogger("MLXBenchmark")
 
 DETAILED_PROMPTS = [
     {
@@ -62,7 +56,7 @@ DETAILED_PROMPTS = [
 ]
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="MTP Simulation Suite for different Gemma 4 models")
+    parser = argparse.ArgumentParser(description="MLX MTP Simulation Suite for different Gemma 4 models")
     parser.add_argument(
         "model",
         type=str,
@@ -74,29 +68,29 @@ def parse_args():
         "--size",
         type=str,
         choices=["e2b", "e4b", "26b", "31b"],
-        help="Gemma 4 model size to benchmark (backward compatible)"
-    )
-    parser.add_argument(
-        "--hf-token",
-        type=str,
-        default=os.environ.get("HF_TOKEN", ""),
-        help="Hugging Face User Access Token (optional if logged in via CLI)"
+        help="Gemma 4 model size to benchmark"
     )
     parser.add_argument(
         "--bits",
         type=int,
         default=16,
         choices=[16, 4],
-        help="Quantization level in bits (16 or 4)"
+        help="Model bit rate (16 or 4)"
     )
     return parser.parse_args()
 
+def get_hf_snapshot_dir(model_id):
+    """Finds the local HF cache snapshot directory for a given model ID."""
+    try:
+        config_path = huggingface_hub.try_to_load_from_cache(model_id, "config.json")
+        if config_path:
+            return os.path.dirname(config_path)
+    except Exception as e:
+        logger.error(f"Error checking cache for {model_id}: {e}")
+    return None
+
 def is_model_fully_cached(model_id):
     """Checks if a model is fully cached locally on disk without loading any weights into RAM."""
-    import os
-    import json
-    import huggingface_hub
-    
     try:
         config_path = huggingface_hub.try_to_load_from_cache(model_id, "config.json")
     except Exception:
@@ -116,105 +110,99 @@ def is_model_fully_cached(model_id):
     if not tokenizer_found:
         return False, "Tokenizer files are missing in cache."
         
-    # Check for weight index or single files
-    index_path = os.path.join(snapshot_dir, "model.safetensors.index.json")
-    if os.path.exists(index_path):
-        try:
-            with open(index_path, "r") as f:
-                index_data = json.load(f)
-            weight_files = set(index_data.get("weight_map", {}).values())
-            if not weight_files:
-                return False, "Index file model.safetensors.index.json is empty or invalid."
-            for wf in weight_files:
-                wf_path = os.path.join(snapshot_dir, wf)
-                if not os.path.exists(wf_path) or os.path.getsize(wf_path) == 0:
-                    return False, f"Weight shard {wf} is missing or incomplete in cache."
-            return True, "Fully cached (sharded safetensors)."
-        except Exception as e:
-            return False, f"Error parsing sharded index: {e}"
-            
-    pt_index_path = os.path.join(snapshot_dir, "pytorch_model.bin.index.json")
-    if os.path.exists(pt_index_path):
-        try:
-            with open(pt_index_path, "r") as f:
-                index_data = json.load(f)
-            weight_files = set(index_data.get("weight_map", {}).values())
-            if not weight_files:
-                return False, "Index file pytorch_model.bin.index.json is empty or invalid."
-            for wf in weight_files:
-                wf_path = os.path.join(snapshot_dir, wf)
-                if not os.path.exists(wf_path) or os.path.getsize(wf_path) == 0:
-                    return False, f"Weight shard {wf} is missing or incomplete in cache."
-            return True, "Fully cached (sharded pytorch bin)."
-        except Exception as e:
-            return False, f"Error parsing pytorch sharded index: {e}"
-            
-    single_weight_files = ["model.safetensors", "pytorch_model.bin"]
+    # Check for weight files (safetensors or npz)
     weight_found = False
-    for wf in single_weight_files:
-        wf_path = os.path.join(snapshot_dir, wf)
-        if os.path.exists(wf_path) and os.path.getsize(wf_path) > 0:
-            weight_found = True
-            break
-            
+    for f in os.listdir(snapshot_dir):
+        if f.endswith(".safetensors") or f.endswith(".npz"):
+            if os.path.getsize(os.path.join(snapshot_dir, f)) > 0:
+                weight_found = True
+                break
+                
     if not weight_found:
-        return False, "No model weight files found in cache."
+        return False, "No weight files (.safetensors or .npz) found in cache."
         
     return True, "Fully cached."
-
-def patch_tokenizer_config(model_id):
-    """Safely patches local tokenizer metadata to suppress unneeded warnings."""
-    pass
 
 def get_current_rss_mb():
     """Returns current process Resident Set Size (RSS) memory in MB."""
     process = psutil.Process(os.getpid())
     return process.memory_info().rss / (1024 * 1024)
 
-def run_single_inference(tokenizer, model, prompt_text, device, max_tokens, assistant_model=None):
+def load_model_custom(path_or_hf_repo, is_assistant=False):
+    """Custom model loader that handles Gemma 4 KV weight mismatches and assistant architectures."""
+    import mlx_lm.utils as u
+    from mlx_lm.utils import load_model, load_tokenizer, _download
+    from mlx_lm.tokenizer_utils import TokenizerWrapper
+    from pathlib import Path
+    
+    # Remap assistant type to gemma4 architecture dynamically
+    u.MODEL_REMAPPING["gemma4_assistant"] = "gemma4"
+    
+    model_path = _download(path_or_hf_repo)
+    model_path = Path(model_path)
+    
+    # Custom config mapping/overrides
+    config = u.load_config(model_path)
+    if is_assistant or config.get("model_type") == "gemma4_assistant":
+        if "text_config" in config:
+            config["text_config"]["num_kv_shared_layers"] = 0
+            
+    # Load model with strict=False to ignore extra parameters (e.g. shared KV projections or assistant centroids)
+    model, loaded_config = load_model(model_path, lazy=False, strict=False, model_config=config)
+    
+    # Load tokenizer
+    tokenizer = load_tokenizer(
+        model_path, {}, eos_token_ids=loaded_config.get("eos_token_id", None)
+    )
+    if not isinstance(tokenizer, TokenizerWrapper):
+        tokenizer = TokenizerWrapper(tokenizer)
+        
+    return model, tokenizer
+
+def run_single_inference(tokenizer, model, prompt_text, max_tokens, assistant_model=None):
     """Executes a single model generation step under resource profiling."""
-    # Apply official Chat Template to prevent looping, blanking, or prompt repetition
+    # Apply official Chat Template
     messages = [{"role": "user", "content": prompt_text}]
     formatted_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(formatted_prompt, return_tensors="pt").to(device)
-    input_len = inputs["input_ids"].shape[1]
-
-    gen_args = {
-        "max_new_tokens": max_tokens,
-        "temperature": 0.1,
-        "do_sample": False,
-        "pad_token_id": tokenizer.pad_token_id,
-    }
-
-    if assistant_model is not None:
-        gen_args["assistant_model"] = assistant_model
 
     # TTFT warm generation
-    ttft_args = gen_args.copy()
-    ttft_args["max_new_tokens"] = 1
-    start_ttft = time.time()
-    with torch.no_grad():
-        _ = model.generate(**inputs, **ttft_args)
-    ttft = (time.time() - start_ttft) * 1000.0
+    start_ttft = time.perf_counter()
+    _ = mlx_lm.generate(model, tokenizer, prompt=formatted_prompt, max_tokens=1, draft_model=assistant_model)
+    mx.eval()
+    ttft = (time.perf_counter() - start_ttft) * 1000.0
 
     # Main generation
     profiler_label = "mtp" if assistant_model is not None else "baseline"
-    prof_name = f"{profiler_label}_{int(time.time())}"
+    prof_name = f"mlx_{profiler_label}_{int(time.time())}"
     prof = ResourceProfiler(interval_sec=0.05, profile_name=prof_name)
     
     prof.start()
-    start_gen = time.time()
-    with torch.no_grad():
-        outputs = model.generate(**inputs, **gen_args)
-    end_gen = time.time()
+    start_gen = time.perf_counter()
+    
+    output_text = ""
+    response = None
+    # Reset peak memory tracker
+    mx.reset_peak_memory()
+    
+    for response in mlx_lm.stream_generate(model, tokenizer, prompt=formatted_prompt, max_tokens=max_tokens, draft_model=assistant_model):
+        output_text += response.text
+        
+    mx.eval()
+    end_gen = time.perf_counter()
     prof_summary = prof.stop(save_dir=config.RAW_PROFILES_DIR)
 
-    total_tokens = len(outputs[0])
-    new_tokens = total_tokens - input_len
     generation_time = end_gen - start_gen
     
-    tokens_per_sec = new_tokens / generation_time if generation_time > 0 else 0.0
-    output_text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+    if response is not None:
+        input_len = response.prompt_tokens
+        new_tokens = response.generation_tokens
+        tokens_per_sec = response.generation_tps
+    else:
+        input_len = 0
+        new_tokens = 0
+        tokens_per_sec = 0.0
+
+    peak_mem_mb = prof_summary.get("peak_memory_mb", 0.0)
 
     metrics = {
         "mode": "MTP" if assistant_model is not None else "Baseline",
@@ -226,18 +214,14 @@ def run_single_inference(tokenizer, model, prompt_text, device, max_tokens, assi
         "avg_cpu_percent": prof_summary.get("avg_cpu_percent", 0.0),
         "peak_cpu_percent": prof_summary.get("peak_cpu_percent", 0.0),
         "start_memory_mb": prof_summary.get("start_memory_mb", 0.0),
-        "peak_memory_mb": prof_summary.get("peak_memory_mb", 0.0),
-        "memory_growth_mb": prof_summary.get("memory_growth_mb", 0.0),
+        "peak_memory_mb": peak_mem_mb,
+        "memory_growth_mb": max(0.0, peak_mem_mb - prof_summary.get("start_memory_mb", 0.0)),
         "raw_text_length": len(output_text)
     }
 
     return metrics, output_text
 
 def main():
-    # Bypass transformers caching allocator warmup to prevent Apple Silicon MPS large contiguous buffer limits
-    import transformers.modeling_utils
-    transformers.modeling_utils.caching_allocator_warmup = lambda *args, **kwargs: None
-
     args = parse_args()
     model_tag = args.model
     size = None
@@ -252,7 +236,7 @@ def main():
         size = args.size
     else:
         logger.error("❌ ERROR: You must specify a model tag (e.g., gemma4:e2b) or size (e.g., e2b).")
-        logger.error("Usage: python run_benchmark.py gemma4:e2b")
+        logger.error("Usage: python mlx_run_benchmark.py gemma4:e2b")
         sys.exit(1)
         
     size = size.lower()
@@ -268,36 +252,37 @@ def main():
 
     bits = args.bits
 
-    # Map size to Hugging Face model IDs
+    # Map size to Hugging Face MLX model IDs
     model_mappings = {
         "e2b": {
-            "target": "google/gemma-4-E2B-it",
-            "assistant": "google/gemma-4-E2B-it-assistant"
+            "target_4bit": "mlx-community/gemma-4-e2b-it-4bit",
+            "target_16bit": "mlx-community/gemma-4-e2b-it-bf16",
+            "assistant": "mlx-community/gemma-4-E2B-it-assistant-bf16"
         },
         "e4b": {
-            "target": "google/gemma-4-E4B-it",
-            "assistant": "google/gemma-4-E4B-it-assistant"
+            "target_4bit": "mlx-community/gemma-4-e4b-it-4bit",
+            "target_16bit": "mlx-community/gemma-4-e4b-it-bf16",
+            "assistant": "mlx-community/gemma-4-E4B-it-assistant-bf16"
         },
         "26b": {
-            "target": "google/gemma-4-26B-A4B-it",
-            "assistant": "google/gemma-4-26B-A4B-it-assistant"
+            "target_4bit": "mlx-community/gemma-4-26b-a4b-it-4bit",
+            "target_16bit": "mlx-community/gemma-4-26b-a4b-it-bf16",
+            "assistant": "mlx-community/gemma-4-26B-A4B-it-assistant-bf16"
         },
         "31b": {
-            "target": "google/gemma-4-31B-it",
-            "assistant": "google/gemma-4-31B-it-assistant"
+            "target_4bit": "mlx-community/gemma-4-31b-it-4bit",
+            "target_16bit": "mlx-community/gemma-4-31b-it-bf16",
+            "assistant": "mlx-community/gemma-4-31B-it-assistant-bf16"
         }
     }
 
-    target_id = model_mappings[size]["target"]
+    target_id = model_mappings[size]["target_4bit"] if bits == 4 else model_mappings[size]["target_16bit"]
     assistant_id = model_mappings[size]["assistant"]
     
-    if bits == 4:
-        results_md_path = f"/Users/pank/Experiments/MTP/docs/results_detailed_{size}_4bit.md"
-    else:
-        results_md_path = f"/Users/pank/Experiments/MTP/docs/results_detailed_{size}.md"
+    results_md_path = f"/Users/pank/Experiments/MTP/docs/mlx_results_detailed_{size}_4bit.md" if bits == 4 else f"/Users/pank/Experiments/MTP/docs/mlx_results_detailed_{size}.md"
 
     logger.info("=========================================")
-    logger.info(f"Initializing Gemma 4 Simulation Suite for size: {size.upper()} ({bits}-bit)")
+    logger.info(f"Initializing Gemma 4 MLX Simulation Suite for size: {size.upper()} ({bits}-bit)")
     logger.info(f"Target:    {target_id}")
     logger.info(f"Assistant: {assistant_id}")
     logger.info("=========================================")
@@ -305,9 +290,6 @@ def main():
     # Initialize variables for static measurements
     mem_start = get_current_rss_mb()
     logger.info(f"Initial Process Memory Footprint: {mem_start:.2f} MB")
-
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    torch_dtype = torch.float16 if device == "mps" else torch.float32
 
     # Pre-flight local cache check
     logger.info("Performing pre-flight local cache validation...")
@@ -323,78 +305,36 @@ def main():
             logger.error(f"  • Assistant model '{assistant_id}' is not fully cached. Reason: {assistant_msg}")
         logger.error("-----------------------------------------")
         logger.error("To resolve this, please explicitly download the required models first using:")
-        logger.error(f"  python download_model.py --size {size}")
+        logger.error(f"  python download_model.py {family}:{size} --mlx")
         logger.error("=========================================")
         sys.exit(1)
         
     logger.info("✅ Pre-flight validation passed! Both models are fully cached locally.")
 
-    patch_tokenizer_config(target_id)
-    patch_tokenizer_config(assistant_id)
+    target_path = get_hf_snapshot_dir(target_id)
+    assistant_path = get_hf_snapshot_dir(assistant_id)
 
-    # 1. Load Tokenizer
-    logger.info("Loading Tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(target_id, trust_remote_code=True, local_files_only=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # 2. Load Target Model & Measure Static Footprint
+    # 1. Load Target Model & Measure Static Footprint
     mem_pre_target = get_current_rss_mb()
-    logger.info(f"Loading Target Model '{target_id}' onto {device}...")
+    logger.info(f"Loading Target Model from cache: {target_path} ...")
     target_start_time = time.time()
     
-    # Configure loading args with direct-MPS loading via device_map to avoid memory duplication
-    load_args = {
-        "torch_dtype": torch_dtype,
-        "low_cpu_mem_usage": True,
-        "trust_remote_code": True,
-        "local_files_only": True,
-        "device_map": "auto" if device == "mps" else None
-    }
+    # Load model and tokenizer via custom loader
+    target_model, tokenizer = load_model_custom(target_path)
     
-    if bits == 4:
-        logger.info("Configuring 4-bit weight-only quantization via optimum-quanto (weights='int4')...")
-        from transformers import QuantoConfig
-        load_args["quantization_config"] = QuantoConfig(weights="int4")
-        load_args["device_map"] = device
-    
-    target_model = AutoModelForCausalLM.from_pretrained(
-        target_id,
-        **load_args
-    )
-    
-    # manual movement to device is only needed if device_map is not used
-    if bits != 4 and device != "mps":
-        target_model = target_model.to(device)
-        
-    target_model.eval()
     target_load_time = time.time() - target_start_time
     mem_post_target = get_current_rss_mb()
     static_target_mem = mem_post_target - mem_pre_target
     logger.info(f"Target Model loaded in {target_load_time:.2f}s | Static RAM footprint: {static_target_mem:.2f} MB")
 
-    # 3. Load Assistant Model & Measure Static Footprint
+    # 2. Load Assistant Model & Measure Static Footprint
     mem_pre_assistant = get_current_rss_mb()
-    logger.info(f"Loading Assistant Model '{assistant_id}' onto {device}...")
+    logger.info(f"Loading Assistant Model from cache: {assistant_path} ...")
     assistant_start_time = time.time()
     
-    assistant_load_args = {
-        "torch_dtype": torch_dtype,
-        "low_cpu_mem_usage": True,
-        "trust_remote_code": True,
-        "local_files_only": True,
-        "device_map": "auto" if device == "mps" else None
-    }
+    # Load assistant model via custom loader with assistant remapping and KV shared layer override
+    assistant_model, _ = load_model_custom(assistant_path, is_assistant=True)
     
-    assistant_model = AutoModelForCausalLM.from_pretrained(
-        assistant_id,
-        **assistant_load_args
-    )
-    
-    if device != "mps":
-        assistant_model = assistant_model.to(device)
-        
-    assistant_model.eval()
     assistant_load_time = time.time() - assistant_start_time
     mem_post_assistant = get_current_rss_mb()
     static_assistant_mem = mem_post_assistant - mem_pre_assistant
@@ -404,10 +344,8 @@ def main():
     total_static_mtp_mb = static_target_mem + static_assistant_mem
     static_mem_increase_mb = static_assistant_mem
     
-    # Handle CPU RSS going negative/near-zero due to GC and dynamic MPS transfers
     effective_baseline = total_static_baseline_mb
     if effective_baseline <= 50.0:
-        # Fallback estimates in MB based on parameter sizes
         size_mappings = {
             "e2b": {"16": 4000.0, "4": 1000.0},
             "e4b": {"16": 8000.0, "4": 2000.0},
@@ -419,17 +357,17 @@ def main():
     static_mem_increase_percent = (static_mem_increase_mb / effective_baseline) * 100.0
 
     logger.info("=========================================")
-    logger.info("STATIC SYSTEM PRESSURE COMPARISON:")
+    logger.info("STATIC SYSTEM PRESSURE COMPARISON (MLX):")
     logger.info(f"  • Baseline Static Footprint: {total_static_baseline_mb:.2f} MB")
     logger.info(f"  • MTP (Baseline + Drafter) Static Footprint: {total_static_mtp_mb:.2f} MB")
     logger.info(f"  • Absolute Static Memory Overhead: +{static_mem_increase_mb:.2f} MB ({static_mem_increase_percent:.1f}% increase)")
     logger.info("=========================================")
 
     # Warm-up phase
-    logger.info("Executing model warm-ups...")
+    logger.info("Executing model warm-ups (compiles Metal shaders)...")
     warmup_prompt = "Warm-up inference check."
-    _, _ = run_single_inference(tokenizer, target_model, warmup_prompt, device, max_tokens=10)
-    _, _ = run_single_inference(tokenizer, target_model, warmup_prompt, device, max_tokens=10, assistant_model=assistant_model)
+    _, _ = run_single_inference(tokenizer, target_model, warmup_prompt, max_tokens=10)
+    _, _ = run_single_inference(tokenizer, target_model, warmup_prompt, max_tokens=10, assistant_model=assistant_model)
     logger.info("Warm-up complete. Starting detailed simulation suite...\n")
 
     results = []
@@ -441,20 +379,17 @@ def main():
         
         logger.info(f"[{test_idx + 1}/{len(DETAILED_PROMPTS)}] Running Scenario: {p_desc}")
 
-        # Determine max tokens to generate (4-bit is slow, so we generate 100 tokens to speed up; 16-bit generates 256)
-        run_max_tokens = 100 if args.bits == 4 else 256
-
         # 1. Run Baseline
-        logger.info("  Executing Baseline Generation...")
-        base_metrics, base_text = run_single_inference(tokenizer, target_model, prompt, device, max_tokens=run_max_tokens)
+        logger.info("  Executing MLX Baseline Generation...")
+        base_metrics, base_text = run_single_inference(tokenizer, target_model, prompt, max_tokens=256)
         base_metrics["prompt_id"] = p_id
         base_metrics["prompt_desc"] = p_desc
         base_metrics["generated_text"] = base_text
         logger.info(f"    Baseline: {base_metrics['tokens_per_sec']} t/s, Peak RAM: {base_metrics['peak_memory_mb']:.1f} MB")
 
         # 2. Run MTP
-        logger.info("  Executing MTP Speculative Generation...")
-        mtp_metrics, mtp_text = run_single_inference(tokenizer, target_model, prompt, device, max_tokens=run_max_tokens, assistant_model=assistant_model)
+        logger.info("  Executing MLX MTP Speculative Generation...")
+        mtp_metrics, mtp_text = run_single_inference(tokenizer, target_model, prompt, max_tokens=256, assistant_model=assistant_model)
         mtp_metrics["prompt_id"] = p_id
         mtp_metrics["prompt_desc"] = p_desc
         mtp_metrics["generated_text"] = mtp_text
@@ -463,13 +398,12 @@ def main():
         results.append((base_metrics, mtp_metrics))
         logger.info("-" * 50)
 
-
     # Compile Markdown file
-    logger.info(f"Generating simulation report at: {results_md_path}")
+    logger.info(f"Generating MLX simulation report at: {results_md_path}")
     with open(results_md_path, "w") as f:
         precision_str = "4-Bit Weight Quantized" if bits == 4 else "16-Bit Precision"
-        f.write(f"# Gemma 4 {size.upper()} MTP Detailed & Complicated Simulation Report ({precision_str})\n\n")
-        f.write(f"This report presents the performance of standard autoregressive decoding (**Baseline**) versus Multi-Token Prediction speculative decoding (**MTP**) on **Gemma 4 {size.upper()}** (loaded in **{precision_str}** via optimum-quanto) across highly detailed, complex scenarios. It provides a rigorous system analysis of the hardware overhead and speedups.\n\n")
+        f.write(f"# Gemma 4 {size.upper()} MLX Detailed Simulation Report ({precision_str})\n\n")
+        f.write(f"This report presents the performance of standard autoregressive decoding (**Baseline**) versus Multi-Token Prediction speculative decoding (**MTP**) on **Gemma 4 {size.upper()}** using Apple Silicon **MLX** backend (loaded in **{precision_str}**). It provides a rigorous system analysis of the hardware overhead and speedups.\n\n")
         
         f.write("## 🖥️ System hardware Overhead & Static Pressure Analysis\n\n")
         f.write("When evaluating the resource footprint of Multi-Token Prediction, we must distinguish between **dynamic memory growth during inference** and **static loading memory overhead** on Unified Memory.\n\n")
@@ -525,7 +459,7 @@ def main():
             f.write(f"*Inference Speed: Baseline = {base['tokens_per_sec']:.2f} t/s | MTP = {mtp['tokens_per_sec']:.2f} t/s ({mtp['tokens_per_sec']/base['tokens_per_sec']:.2f}x speedup)*\n\n")
             f.write("---\n\n")
 
-    logger.info(f"Simulation complete for Gemma 4 {size.upper()} and results successfully saved.")
+    logger.info(f"Simulation complete for Gemma 4 {size.upper()} (MLX) and results successfully saved.")
 
 if __name__ == "__main__":
     main()

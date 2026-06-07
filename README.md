@@ -82,36 +82,65 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Running the Benchmarks
+### 3. Downloading & Running Benchmarks
+
+This suite utilizes an explicit two-stage workflow to prevent accidental downloads of multi-gigabyte models (like the 26B or 31B checkpoints) and ensures complete local control.
+
 > [!IMPORTANT]
 > **Virtual Environment Active:** You must run these scripts using your virtual environment Python to prevent import conflicts with old global libraries. Either ensure `venv` is active (`source venv/bin/activate`) or run using `venv/bin/python` directly.
 
+---
+
+#### 📦 Step 1: Download & Cache Model Weights
+To download and cache a specific model and its assistant drafter explicitly using a model tag (e.g. `gemma4:e2b`):
+
+```bash
+# Explicitly download E2B models (target & assistant)
+venv/bin/python download_model.py gemma4:e2b
+
+# Explicitly download E4B models
+venv/bin/python download_model.py gemma4:e4b
+```
+*Note: If downloading a model fails or is aborted midway, the benchmarking scripts will detect the incomplete cache files and ask you to re-run the download script instead of crashing.*
+
+---
+
+#### ⚡ Step 2: Run the Offline Benchmarks
+The benchmarking runners operate **fully offline** (`local_files_only=True`) and make zero network calls. They will only run if the target and assistant models are fully cached.
+
 By default, the runner uses standard **16-bit precision** (`--bits 16`). To run in memory-efficient **4-bit weight-quantized mode** using Hugging Face's `optimum-quanto` library, specify `--bits 4`.
 
-#### A. Running Standalone Models
-To run a specific size at a specific quantization level (e.g., E2B in 4-bit):
+##### A. Running a Single Model Benchmark
+To run a specific model at a specific quantization level (e.g., E2B in 4-bit):
 
 ```bash
 # Runs E2B in 4-bit quantized mode (drastically reducing Unified RAM requirements)
-venv/bin/python run_benchmark.py --size e2b --bits 4
+venv/bin/python run_benchmark.py gemma4:e2b --bits 4
 
 # Runs E2B in standard 16-bit mode
-venv/bin/python run_benchmark.py --size e2b --bits 16
+venv/bin/python run_benchmark.py gemma4:e2b --bits 16
 ```
+*If a model size is not cached, the script will exit with a descriptive warning telling you to run the download script first.*
 
-#### B. Running the Automated Pipeline
+##### B. Running the Automated Sequential Pipeline
 To run the full sequential benchmark pipeline across all supported Gemma 4 models (`e2b` ➡️ `e4b` ➡️ `26b` ➡️ `31b`) automatically in 4-bit:
 
 ```bash
-# Runs the multi-model sequential orchestrator in 4-bit quantized mode
+# Runs the sequential orchestrator in 4-bit quantized mode
 venv/bin/python run_sequential_benchmarks.py --bits 4
 ```
 
-To render the comparison visualization:
+> [!TIP]
+> **Dynamic Skipping Mechanics:** The sequential orchestrator automatically scans the local Hugging Face cache. It will execute benchmarks *only* for the sizes that are fully cached on your disk, automatically and cleanly skipping any sizes that are not present.
+
+---
+
+#### 📊 Step 3: Render Comparison Visualization
+To render the comparative benchmark performance bar chart:
 
 ```bash
 # Generates assets/gemma_mtp_benchmark.png
-python scratch/generate_chart.py
+venv/bin/python scratch/generate_chart.py
 ```
 
 ---
